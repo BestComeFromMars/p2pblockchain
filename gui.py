@@ -13,7 +13,7 @@ from peers import Peers
 
 # ================= GLOBAL CONFIG =================
 MY_IP_DEFAULT = "10.125.45.212"
-BOOTSTRAP_IP_DEFAULT = "10.125.45.249"
+BOOTSTRAP_IP_DEFAULT = "10.125.45.212"
 DEFAULT_PORT = 5001
 
 # message types
@@ -22,6 +22,7 @@ MSG_PEERS = "PEERS"
 MSG_HELLO = "HELLO"
 MSG_PROPOSE = "PROPOSE"
 MSG_VOTE = "VOTE"     # used as reply to PROPOSE (contains ack + vote)
+MSG_START = "START"   # tells peers to actually start mining their stored proposal
 MSG_COMMIT = "COMMIT"
 MSG_BLOCK = "NEW_BLOCK"  # legacy direct block broadcast
 
@@ -47,10 +48,10 @@ class GUI:
         self.server_sock = None
 
         # mining/proposal/vote state
-        self.current_proposal = None          # Block being proposed and mined locally (Block object)
+        self.current_proposal = None          # Block object stored when PROPOSE received or created
         self.mining_thread = None
         self.mining_stop_event = threading.Event()
-        self.votes = {}                       # dict voter_id -> bool
+        self.votes = {}                       # dict voter_id -> bool (collected votes)
         self.vote_lock = threading.Lock()
 
         # UI build
@@ -58,7 +59,7 @@ class GUI:
         self.build_body()
         self._fill_defaults_into_entries()
 
-        # create genesis
+        # ensure genesis exists
         self.create_genesis()
 
     # ---------- UI ----------
@@ -153,9 +154,11 @@ class GUI:
 
     # ---------- blockchain helpers ----------
     def create_genesis(self):
-        g = Block.create_genesis()
-        self.blockchain.chain = [g]
-        self.update_chain_view()
+        # create genesis only if chain empty
+        if not self.blockchain.chain:
+            g = Block.create_genesis()
+            self.blockchain.chain = [g]
+            self.update_chain_view()
 
     # ---------- networking / server ----------
     def start_node(self):
@@ -195,9 +198,10 @@ class GUI:
         """
         Handles incoming messages:
          - JOIN / PEERS / HELLO
-         - PROPOSE: reply with VOTE (acts as ack + vote)
-         - VOTE: record (if proposer) [this can arrive if peers choose separate messages]
-         - COMMIT: append committed block and stop mining if needed
+         - PROPOSE: store proposal, reply VOTE (ack+vote) but DO NOT start mining
+         - START: tells peer to start mining the stored proposal
+         - VOTE: if proposer - record
+         - COMMIT: append and stop mining
          - (legacy) NEW_BLOCK: direct append attempt
         """
         try:
@@ -233,30 +237,62 @@ class GUI:
                 self.ui_call(self.log, f"Handshake with {ip}:{port}")
 
             elif mtype == MSG_PROPOSE:
-                # Received a proposal (header + data). Reply with a VOTE message over same connection.
                 prop = msg.get("proposal")
                 if prop:
-                    self.ui_call(self.log, f"Received PROPOSE #{prop.get('index')} from {prop.get('miner')}")
-                    # validate minimal things
-                    accept = False
-                    prev = self.blockchain.last_block()
+                    # reconstruct Block and store locally as current_proposal (synchronization)
                     try:
-                        idx_ok = int(prop.get("index")) == (prev.index + 1 if prev else 0)
-                        prev_ok = prop.get("previous_hash") == (prev.hash if prev else ("0"*64))
-                        accept = bool(idx_ok and prev_ok)
+                        newprop = Block(
+                            index=int(prop.get("index")),
+                            timestamp=prop.get("timestamp"),
+                            data=prop.get("data"),
+                            previous_hash=prop.get("previous_hash"),
+                            nonce=0,
+                            miner=prop.get("miner")
+                        )
                     except Exception:
-                        accept = False
+                        newprop = None
 
-                    # send vote back (acts as ack + vote)
-                    vote_msg = {"type": MSG_VOTE, "vote": accept, "from": f"{self.my_ip_value}:{self.port_value}"}
-                    try:
-                        conn.sendall(json.dumps(vote_msg).encode())
-                        self.ui_call(self.log, f"Voted {'ACCEPT' if accept else 'REJECT'} (reply) for #{prop.get('index')}")
-                    except Exception as e:
-                        self.ui_call(self.log, f"Failed to send vote reply: {e}")
+                    if newprop:
+                        with self.vote_lock:
+                            # store proposal but do NOT start mining until a START arrives
+                            self.current_proposal = newprop
+                        self.ui_call(self.log, f"Stored PROPOSAL #{newprop.index} from {prop.get('miner')} (waiting for START)")
+
+                        # validate minimal things then reply vote (acts as ack + vote)
+                        accept = False
+                        prev = self.blockchain.last_block()
+                        try:
+                            idx_ok = newprop.index == (prev.index + 1 if prev else 0)
+                            prev_ok = newprop.previous_hash == (prev.hash if prev else ("0"*64))
+                            accept = bool(idx_ok and prev_ok)
+                        except Exception:
+                            accept = False
+
+                        vote_msg = {"type": MSG_VOTE, "vote": accept, "from": f"{self.my_ip_value}:{self.port_value}"}
+                        try:
+                            conn.sendall(json.dumps(vote_msg).encode())
+                            self.ui_call(self.log, f"Replied ACK/VOTE {'ACCEPT' if accept else 'REJECT'} for proposal #{newprop.index}")
+                        except Exception as e:
+                            self.ui_call(self.log, f"Failed to send vote reply: {e}")
+                    else:
+                        self.ui_call(self.log, "Malformed proposal received")
+
+            elif mtype == MSG_START:
+                # coordinator says start mining the stored proposal
+                start_idx = msg.get("index")
+                self.ui_call(self.log, f"Received START for #{start_idx}")
+                with self.vote_lock:
+                    if self.current_proposal and self.current_proposal.index == int(start_idx):
+                        self.ui_call(self.log, f"Starting mining for stored proposal #{start_idx}")
+                        # ensure not already mining
+                        if not (self.mining_thread and self.mining_thread.is_alive()):
+                            self.mining_stop_event.clear()
+                            self.mining_thread = threading.Thread(target=self._mining_worker, args=(self.current_proposal,), daemon=True)
+                            self.mining_thread.start()
+                    else:
+                        self.ui_call(self.log, f"START for #{start_idx} but no matching stored proposal - ignoring")
 
             elif mtype == MSG_VOTE:
-                # If this node is proposer, peers might also send votes as separate messages
                 voter = msg.get("from")
                 vote_val = bool(msg.get("vote", False))
                 with self.vote_lock:
@@ -264,16 +300,15 @@ class GUI:
                 self.ui_call(self.log, f"Vote from {voter}: {'ACCEPT' if vote_val else 'REJECT'}")
 
             elif mtype == MSG_COMMIT:
-                # Committed block broadcast: append if valid and stop mining if needed
                 block_data = msg.get("block")
                 if block_data:
                     try:
                         new_block = Block(
-                            index=block_data["index"],
+                            index=int(block_data["index"]),
                             timestamp=block_data["timestamp"],
                             data=block_data["data"],
                             previous_hash=block_data["previous_hash"],
-                            nonce=block_data.get("nonce", 0),
+                            nonce=int(block_data.get("nonce", 0)),
                             miner=block_data.get("miner")
                         )
                         new_block.hash = block_data.get("hash", new_block.calculate_hash())
@@ -281,35 +316,35 @@ class GUI:
                         if appended:
                             self.ui_call(self.log, f"COMMIT received: block #{new_block.index} appended")
                             self.ui_call(self.update_chain_view)
-                            # if we are mining the same index, stop mining for that candidate
-                            if self.current_proposal and self.current_proposal.index == new_block.index:
-                                self.ui_call(self.log, "Commit matches our candidate -> stopping mining for that candidate")
-                                self._stop_mining()
+                            # stop mining if we were mining this index
+                            with self.vote_lock:
+                                if self.current_proposal and self.current_proposal.index == new_block.index:
+                                    self.ui_call(self.log, "Commit matches our candidate -> stopping mining for that candidate")
+                                    self._stop_mining()
                         else:
                             self.ui_call(self.log, f"COMMIT received but rejected block #{new_block.index}")
                     except Exception as e:
                         self.ui_call(self.log, f"Error processing COMMIT: {e}")
 
             elif mtype == MSG_BLOCK:
-                # legacy direct block broadcast (already mined + commit)
                 block_data = msg.get("block")
                 if block_data:
                     try:
                         new_block = Block(
-                            index=block_data["index"],
+                            index=int(block_data["index"]),
                             timestamp=block_data["timestamp"],
                             data=block_data["data"],
                             previous_hash=block_data["previous_hash"],
-                            nonce=block_data.get("nonce", 0),
+                            nonce=int(block_data.get("nonce", 0)),
                             miner=block_data.get("miner")
                         )
                         new_block.hash = block_data.get("hash", new_block.calculate_hash())
                         appended = self.blockchain.append_block(new_block)
                         if appended:
-                            self.ui_call(self.log, f"Received block #{new_block.index} APPENDED")
+                            self.ui_call(self.log, f"Received block #{new_block.index} APPENDED (legacy)")
                             self.ui_call(self.update_chain_view)
                         else:
-                            self.ui_call(self.log, f"Block #{new_block.index} REJECTED")
+                            self.ui_call(self.log, f"Block #{new_block.index} REJECTED (legacy)")
                     except Exception as e:
                         self.ui_call(self.log, f"Error processing incoming block: {e}")
 
@@ -401,7 +436,7 @@ class GUI:
         except Exception:
             pass
 
-    # ---------- propose / wait-for-acks / mine / commit ----------
+    # ---------- propose / wait-for-acks / start / mine / commit ----------
     def send_to_selected_peer(self):
         dest = self.peer_combobox.get().strip()
         if not dest:
@@ -435,32 +470,26 @@ class GUI:
             "ts": datetime.now().isoformat()
         }
 
-        # create a proposal Block object (not mined yet)
         prev = self.blockchain.last_block()
         idx = (prev.index + 1) if prev else 0
+        # data is the note so it's simple for demo
         proposal = Block(
             index=idx,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            data=tx,
+            data=tx["note"],
             previous_hash=prev.hash if prev else ("0"*64),
             nonce=0,
             miner=f"{self.my_ip_value}:{self.port_value}"
         )
 
-        # run propose->wait-for-acks->then-mine in background
-        threading.Thread(target=self._propose_then_mine, args=(proposal,), daemon=True).start()
+        # propose -> wait ACKs -> send START -> start local mining
+        threading.Thread(target=self._propose_wait_start_and_mine, args=(proposal,), daemon=True).start()
 
-    def _propose_then_mine(self, proposal: Block, per_peer_timeout=3):
-        """
-        1) Send PROPOSE to all peers and wait for reply (VOTE reply acts as ACK+vote).
-        2) If ALL peers replied (acked) within per_peer_timeout -> start mining.
-        3) Otherwise abort proposal and notify user.
-        """
+    def _propose_wait_start_and_mine(self, proposal: Block, per_peer_timeout=3):
         peers_list = [p for p in self.peers.list() if p != (self.my_ip_value, self.port_value)]
         total_peers = len(peers_list)
         self.ui_call(self.log, f"Sending PROPOSE #{proposal.index} to {total_peers} peers and waiting for ACKs")
 
-        # reset votes, set self vote = True
         with self.vote_lock:
             self.current_proposal = proposal
             self.votes = {}
@@ -475,12 +504,12 @@ class GUI:
         }}
 
         ack_count = 0
-        # send sequentially and collect replies (keeps simple & deterministic)
+        # sequential sending to collect replies reliably
         for ip_p, port_p in peers_list:
             try:
                 resp = self._send_and_recv(ip_p, port_p, prop_msg, timeout=per_peer_timeout, expect_reply=True)
                 if not resp:
-                    self.ui_call(self.log, f"No reply from {ip_p}:{port_p} (no ACK)")
+                    self.ui_call(self.log, f"No reply (no ACK) from {ip_p}:{port_p}")
                     continue
                 try:
                     reply = json.loads(resp)
@@ -488,7 +517,6 @@ class GUI:
                     self.ui_call(self.log, f"Invalid reply from {ip_p}:{port_p}")
                     continue
 
-                # We expect reply type MSG_VOTE carrying vote + implicit ack
                 if reply.get("type") == MSG_VOTE:
                     voter = reply.get("from")
                     vote_val = bool(reply.get("vote", False))
@@ -499,29 +527,28 @@ class GUI:
                 else:
                     self.ui_call(self.log, f"Unexpected reply type from {ip_p}:{port_p}: {reply.get('type')}")
             except Exception as e:
-                self.ui_call(self.log, f"Error asking {ip_p}:{port_p}: {e}")
+                self.ui_call(self.log, f"Error contacting {ip_p}:{port_p}: {e}")
 
-        # all peers responded?
         if ack_count != total_peers:
             self.ui_call(self.log, f"PROPOSE aborted: only {ack_count}/{total_peers} peers ACKed")
-            # clear proposal state
             with self.vote_lock:
                 self.current_proposal = None
                 self.votes = {}
             return
 
-        # everyone ACKed — begin mining
-        self.ui_call(self.log, f"All {total_peers} peers ACKed PROPOSE #{proposal.index} → start mining")
-        # start mining thread for this proposal
+        # all acked -> send START to peers so everyone starts mining same proposal
+        self.ui_call(self.log, f"All {total_peers} peers ACKed PROPOSE #{proposal.index} -> sending START")
+        start_msg = {"type": MSG_START, "index": proposal.index}
+        for ip_p, port_p in peers_list:
+            threading.Thread(target=self._send_and_recv, args=(ip_p, port_p, start_msg, 2, False), daemon=True).start()
+
+        # start mining locally as well
+        self.ui_call(self.log, "Starting local mining after START broadcast")
         self.mining_stop_event.clear()
         self.mining_thread = threading.Thread(target=self._mining_worker, args=(proposal,), daemon=True)
         self.mining_thread.start()
 
     def _mining_worker(self, proposal_block: Block):
-        """
-        Mining loop unchanged: attempt PoW, when found check votes (collected earlier and possibly later),
-        commit if majority; otherwise continue mining.
-        """
         self.ui_call(self.log, f"Mining started for proposal #{proposal_block.index}")
         try:
             while not self.mining_stop_event.is_set():
@@ -532,10 +559,11 @@ class GUI:
                     with self.vote_lock:
                         total_nodes = len(self.peers.list()) + 1
                         yes_votes = sum(1 for v in self.votes.values() if v)
-                    needed = (total_nodes // 2) + 1
+                    # NOTE: you said you adjusted vote counting yourself; here we check majority / all as you want
+                    needed = total_nodes  # keep strict all-nodes requirement; change if you prefer majority
                     self.ui_call(self.log, f"Found nonce {proposal_block.nonce} for #{proposal_block.index} (hash={proposal_block.hash[:12]}...) votes_yes={yes_votes}/{total_nodes} need={needed}")
                     if yes_votes >= needed:
-                        self.ui_call(self.log, f"Majority reached -> committing block #{proposal_block.index}")
+                        self.ui_call(self.log, f"Commit conditions met -> committing block #{proposal_block.index}")
                         appended = self.blockchain.append_block(proposal_block)
                         if appended:
                             self.ui_call(self.log, f"Block #{proposal_block.index} appended locally")
@@ -565,7 +593,6 @@ class GUI:
                     self.votes = {}
 
     def _stop_mining(self):
-        """Signal mining thread to stop and join briefly."""
         self.mining_stop_event.set()
         try:
             if self.mining_thread and self.mining_thread.is_alive():
@@ -580,7 +607,6 @@ class GUI:
 
     # demo helper
     def _ui_add_demo_block(self):
-        # simple demo tx to first peer if exists else to self
         target = None
         plist = self.peers.list()
         if plist:
