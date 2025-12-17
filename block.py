@@ -26,13 +26,26 @@ class Block:
             "miner": self.miner
         }
 
+    def to_pretty(self):
+        return (
+            f"Block #{self.index}\n"
+            f"Timestamp : {self.timestamp}\n"
+            f"Miner     : {self.miner}\n"
+            f"Nonce     : {self.nonce}\n"
+            f"PrevHash  : {self.previous_hash}\n"
+            f"Hash      : {self.hash}\n"
+            f"Data      : {self.data}\n"
+            f"{'-'*60}\n"
+        )
+
+
     def to_json(self):
         # deterministic serialization for hashing/network
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
     def calculate_hash(self):
         if self.index == 0:
-            return "000abc"
+            return "0" * 64
         raw = f"{self.index}{self.timestamp}{json.dumps(self.data, sort_keys=True, separators=(',', ':'))}{self.previous_hash}{self.nonce}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
