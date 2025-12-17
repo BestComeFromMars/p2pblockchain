@@ -21,9 +21,9 @@ MSG_JOIN = "JOIN"
 MSG_PEERS = "PEERS"
 MSG_HELLO = "HELLO"
 MSG_PROPOSE = "PROPOSE"
-MSG_VOTE = "VOTE"
+MSG_VOTE = "VOTE"     # used as reply to PROPOSE (contains ack + vote)
 MSG_COMMIT = "COMMIT"
-MSG_BLOCK = "NEW_BLOCK"  # (legacy - direct commit broadcast if used)
+MSG_BLOCK = "NEW_BLOCK"  # legacy direct block broadcast
 
 # ================= GUI / Node =================
 class GUI:
@@ -195,8 +195,8 @@ class GUI:
         """
         Handles incoming messages:
          - JOIN / PEERS / HELLO
-         - PROPOSE: reply with VOTE immediately (silent)
-         - VOTE: record (if proposer)
+         - PROPOSE: reply with VOTE (acts as ack + vote)
+         - VOTE: record (if proposer) [this can arrive if peers choose separate messages]
          - COMMIT: append committed block and stop mining if needed
          - (legacy) NEW_BLOCK: direct append attempt
         """
@@ -247,16 +247,16 @@ class GUI:
                     except Exception:
                         accept = False
 
-                    # send vote back (silent reply)
+                    # send vote back (acts as ack + vote)
                     vote_msg = {"type": MSG_VOTE, "vote": accept, "from": f"{self.my_ip_value}:{self.port_value}"}
                     try:
                         conn.sendall(json.dumps(vote_msg).encode())
-                        self.ui_call(self.log, f"Voted {'ACCEPT' if accept else 'REJECT'} for #{prop.get('index')} (silent)")
+                        self.ui_call(self.log, f"Voted {'ACCEPT' if accept else 'REJECT'} (reply) for #{prop.get('index')}")
                     except Exception as e:
                         self.ui_call(self.log, f"Failed to send vote reply: {e}")
 
             elif mtype == MSG_VOTE:
-                # If this node is proposer, peers might also send votes as separate messages (or replies).
+                # If this node is proposer, peers might also send votes as separate messages
                 voter = msg.get("from")
                 vote_val = bool(msg.get("vote", False))
                 with self.vote_lock:
@@ -401,7 +401,7 @@ class GUI:
         except Exception:
             pass
 
-    # ---------- propose / vote / mine / commit ----------
+    # ---------- propose / wait-for-acks / mine / commit ----------
     def send_to_selected_peer(self):
         dest = self.peer_combobox.get().strip()
         if not dest:
@@ -447,13 +447,25 @@ class GUI:
             miner=f"{self.my_ip_value}:{self.port_value}"
         )
 
-        # set current_proposal and reset votes (count self as yes)
+        # run propose->wait-for-acks->then-mine in background
+        threading.Thread(target=self._propose_then_mine, args=(proposal,), daemon=True).start()
+
+    def _propose_then_mine(self, proposal: Block, per_peer_timeout=3):
+        """
+        1) Send PROPOSE to all peers and wait for reply (VOTE reply acts as ACK+vote).
+        2) If ALL peers replied (acked) within per_peer_timeout -> start mining.
+        3) Otherwise abort proposal and notify user.
+        """
+        peers_list = [p for p in self.peers.list() if p != (self.my_ip_value, self.port_value)]
+        total_peers = len(peers_list)
+        self.ui_call(self.log, f"Sending PROPOSE #{proposal.index} to {total_peers} peers and waiting for ACKs")
+
+        # reset votes, set self vote = True
         with self.vote_lock:
             self.current_proposal = proposal
             self.votes = {}
             self.votes[f"{self.my_ip_value}:{self.port_value}"] = True
 
-        # broadcast PROPOSE and collect silent replies (VOTE) asynchronously
         prop_msg = {"type": MSG_PROPOSE, "proposal": {
             "index": proposal.index,
             "previous_hash": proposal.previous_hash,
@@ -462,45 +474,53 @@ class GUI:
             "data": proposal.data
         }}
 
-        self.ui_call(self.log, f"PROPOSE block #{proposal.index} to peers (collecting silent votes)")
-
-        # spawn threads to send PROPOSE and process reply votes
-        for ip_p, port_p in self.peers.list():
-            if (ip_p, port_p) == (self.my_ip_value, self.port_value):
-                continue
-            threading.Thread(target=self._send_propose_and_collect_vote, args=(ip_p, port_p, prop_msg), daemon=True).start()
-
-        # start mining thread for this proposal
-        self.mining_stop_event.clear()
-        self.mining_thread = threading.Thread(target=self._mining_worker, args=(proposal,), daemon=True)
-        self.mining_thread.start()
-
-    def _send_propose_and_collect_vote(self, ip, port, prop_msg):
-        """Send PROPOSE with expect_reply=True and parse a VOTE reply if any."""
-        try:
-            resp = self._send_and_recv(ip, port, prop_msg, timeout=3, expect_reply=True)
-            if not resp:
-                return
+        ack_count = 0
+        # send sequentially and collect replies (keeps simple & deterministic)
+        for ip_p, port_p in peers_list:
             try:
-                reply = json.loads(resp)
+                resp = self._send_and_recv(ip_p, port_p, prop_msg, timeout=per_peer_timeout, expect_reply=True)
+                if not resp:
+                    self.ui_call(self.log, f"No reply from {ip_p}:{port_p} (no ACK)")
+                    continue
+                try:
+                    reply = json.loads(resp)
+                except json.JSONDecodeError:
+                    self.ui_call(self.log, f"Invalid reply from {ip_p}:{port_p}")
+                    continue
+
+                # We expect reply type MSG_VOTE carrying vote + implicit ack
                 if reply.get("type") == MSG_VOTE:
                     voter = reply.get("from")
                     vote_val = bool(reply.get("vote", False))
                     with self.vote_lock:
                         self.votes[voter] = vote_val
-                    self.ui_call(self.log, f"Collected vote from {voter}: {'ACCEPT' if vote_val else 'REJECT'}")
-            except json.JSONDecodeError:
-                return
-        except Exception as e:
-            self.ui_call(self.log, f"Propose->vote error to {ip}:{port}: {e}")
+                    ack_count += 1
+                    self.ui_call(self.log, f"ACK/VOTE from {voter}: {'ACCEPT' if vote_val else 'REJECT'}")
+                else:
+                    self.ui_call(self.log, f"Unexpected reply type from {ip_p}:{port_p}: {reply.get('type')}")
+            except Exception as e:
+                self.ui_call(self.log, f"Error asking {ip_p}:{port_p}: {e}")
+
+        # all peers responded?
+        if ack_count != total_peers:
+            self.ui_call(self.log, f"PROPOSE aborted: only {ack_count}/{total_peers} peers ACKed")
+            # clear proposal state
+            with self.vote_lock:
+                self.current_proposal = None
+                self.votes = {}
+            return
+
+        # everyone ACKed — begin mining
+        self.ui_call(self.log, f"All {total_peers} peers ACKed PROPOSE #{proposal.index} → start mining")
+        # start mining thread for this proposal
+        self.mining_stop_event.clear()
+        self.mining_thread = threading.Thread(target=self._mining_worker, args=(proposal,), daemon=True)
+        self.mining_thread.start()
 
     def _mining_worker(self, proposal_block: Block):
         """
-        Mining loop:
-         - keep incrementing nonce until PoW found or stop event set
-         - when PoW found, check votes: if majority yes -> COMMIT and broadcast
-         - otherwise continue mining (votes may arrive later)
-         - if COMMIT received externally for this index, stop mining
+        Mining loop unchanged: attempt PoW, when found check votes (collected earlier and possibly later),
+        commit if majority; otherwise continue mining.
         """
         self.ui_call(self.log, f"Mining started for proposal #{proposal_block.index}")
         try:
@@ -509,15 +529,12 @@ class GUI:
                 proposal_block.hash = proposal_block.calculate_hash()
 
                 if proposal_block.hash.startswith("0" * DIFFICULTY):
-                    # got PoW
                     with self.vote_lock:
                         total_nodes = len(self.peers.list()) + 1
                         yes_votes = sum(1 for v in self.votes.values() if v)
                     needed = (total_nodes // 2) + 1
-                    self.ui_call(self.log, f"Found nonce {proposal_block.nonce} for #{proposal_block.index} hash={proposal_block.hash[:12]}... votes_yes={yes_votes}/{total_nodes} need={needed}")
+                    self.ui_call(self.log, f"Found nonce {proposal_block.nonce} for #{proposal_block.index} (hash={proposal_block.hash[:12]}...) votes_yes={yes_votes}/{total_nodes} need={needed}")
                     if yes_votes >= needed:
-                        # finalize -> append & broadcast COMMIT
-                        # ensure block.hash present
                         self.ui_call(self.log, f"Majority reached -> committing block #{proposal_block.index}")
                         appended = self.blockchain.append_block(proposal_block)
                         if appended:
@@ -532,20 +549,16 @@ class GUI:
                                 continue
                             threading.Thread(target=self._send_and_recv, args=(ip_p, port_p, commit_msg, 2, False), daemon=True).start()
 
-                        # stop mining for this proposal
                         self._stop_mining()
                         return
                     else:
-                        # not enough votes yet -> keep mining
                         self.ui_call(self.log, f"Not enough votes yet for #{proposal_block.index}; continue mining")
-                # yield occasionally
                 if proposal_block.nonce % 2000 == 0:
                     time.sleep(0.01)
             self.ui_call(self.log, "Mining thread stopped by event")
         except Exception as e:
             self.ui_call(self.log, f"Mining error: {e}")
         finally:
-            # clear state if this was our proposal
             with self.vote_lock:
                 if self.current_proposal and self.current_proposal.index == proposal_block.index:
                     self.current_proposal = None
