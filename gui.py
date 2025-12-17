@@ -33,6 +33,9 @@ class GUI:
         self.root.title("Blockchain Transfer Simulator (P2P Demo)")
         self.root.geometry("1200x700")
 
+        # node identity
+        self.node_name = socket.gethostname()
+
         # defaults
         self.my_ip_value = MY_IP_DEFAULT
         self.port_value = DEFAULT_PORT
@@ -41,6 +44,8 @@ class GUI:
 
         # peers and blockchain
         self.peers = Peers(local_ip=self.my_ip_value, local_port=self.port_value)
+        # mapping (ip,port) -> name
+        self.peer_info = {}
         self.blockchain = Blockchain(difficulty=DIFFICULTY)
 
         # server
@@ -59,8 +64,7 @@ class GUI:
         self.build_body()
         self._fill_defaults_into_entries()
 
-        # ensure genesis exists
-        self.create_genesis()
+        # NOTE: No genesis block creation here (user requested)
 
     # ---------- UI ----------
     def build_head(self):
@@ -88,33 +92,33 @@ class GUI:
     def build_body(self):
         body = ttk.Frame(self.root); body.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(body, width=300, padding=5); left.pack(side=tk.LEFT, fill=tk.Y)
+        left = ttk.Frame(body, width=360, padding=5); left.pack(side=tk.LEFT, fill=tk.Y)
 
         ttk.Label(left, text="Peers").pack(anchor="w")
-        self.peer_list = tk.Listbox(left, width=30, height=20); self.peer_list.pack(fill=tk.BOTH, expand=True)
+        self.peer_list = tk.Listbox(left, width=40, height=20); self.peer_list.pack(fill=tk.BOTH, expand=True)
         self.peer_list.bind("<<ListboxSelect>>", self.on_peer_list_select)
 
         self.send_frame = ttk.LabelFrame(left, text="Send from me → peer", padding=6)
         self.send_frame.pack(fill=tk.X, pady=(8,0))
 
         ttk.Label(self.send_frame, text="To:").grid(row=0, column=0, sticky="w")
-        self.peer_combobox = ttk.Combobox(self.send_frame, width=20, state="readonly"); self.peer_combobox.grid(row=0, column=1, padx=6, pady=2)
+        self.peer_combobox = ttk.Combobox(self.send_frame, width=26, state="readonly"); self.peer_combobox.grid(row=0, column=1, padx=6, pady=2)
 
         ttk.Label(self.send_frame, text="Amount:").grid(row=1, column=0, sticky="w")
         self.amount_entry = ttk.Entry(self.send_frame, width=12); self.amount_entry.grid(row=1, column=1, padx=6, pady=2)
 
         ttk.Label(self.send_frame, text="Content:").grid(row=2, column=0, sticky="w")
-        self.note_entry = ttk.Entry(self.send_frame, width=20); self.note_entry.grid(row=2, column=1, padx=6, pady=2)
+        self.note_entry = ttk.Entry(self.send_frame, width=26); self.note_entry.grid(row=2, column=1, padx=6, pady=2)
 
         ttk.Button(self.send_frame, text="Send to selected", command=self.send_to_selected_peer).grid(row=3, column=0, columnspan=2, pady=(6,0))
 
         right = ttk.Frame(body, padding=5); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         ttk.Label(right, text="Event Log").pack(anchor="w")
-        self.log_text = tk.Text(right, height=10, state=tk.DISABLED); self.log_text.pack(fill=tk.X)
+        self.log_text = tk.Text(right, height=12, state=tk.DISABLED); self.log_text.pack(fill=tk.X)
 
         ttk.Label(right, text="Blockchain").pack(anchor="w", pady=(6,0))
-        self.chain_text = tk.Text(right, height=15); self.chain_text.pack(fill=tk.BOTH, expand=True)
+        self.chain_text = tk.Text(right, height=18); self.chain_text.pack(fill=tk.BOTH, expand=True)
 
     def _fill_defaults_into_entries(self):
         self.my_ip_entry.insert(0, self.my_ip_value)
@@ -143,9 +147,16 @@ class GUI:
                 self.chain_text.insert(tk.END, str(b.to_dict()) + "\n\n")
 
     def update_peers_view(self):
+        # Show name (ip:port) in listbox
         self.peer_list.delete(0, tk.END)
+        entries = []
         for ip, port in self.peers.list():
-            self.peer_list.insert(tk.END, f"{ip}:{port}")
+            name = self.peer_info.get((ip, port), f"{ip}:{port}")
+            label = f"{name} ({ip}:{port})"
+            entries.append((label, f"{ip}:{port}"))
+            self.peer_list.insert(tk.END, label)
+
+        # Combobox values are ip:port strings for connection, but labels in listbox show names
         vals = [f"{ip}:{port}" for ip, port in self.peers.list() if (ip, port) != (self.my_ip_value, self.port_value)]
         try:
             self.peer_combobox['values'] = vals
@@ -153,12 +164,42 @@ class GUI:
             pass
 
     # ---------- blockchain helpers ----------
-    def create_genesis(self):
-        # create genesis only if chain empty
-        if not self.blockchain.chain:
-            g = Block.create_genesis()
-            self.blockchain.chain = [g]
-            self.update_chain_view()
+    def _serialize_chain(self):
+        return [b.to_dict() for b in self.blockchain.chain]
+
+    def _deserialize_chain_and_validate(self, chain_list):
+        """
+        Try to build Block objects from list of dicts and validate sequentially.
+        Return list_of_Block if valid else None.
+        """
+        try:
+            temp = []
+            for idx, d in enumerate(chain_list):
+                b = Block(
+                    index=int(d["index"]),
+                    timestamp=d["timestamp"],
+                    data=d["data"],
+                    previous_hash=d["previous_hash"],
+                    nonce=int(d.get("nonce", 0)),
+                    miner=d.get("miner")
+                )
+                b.hash = d.get("hash", b.calculate_hash())
+                # validate PoW if not genesis-like (allow genesis if index==0)
+                if idx == 0:
+                    # index 0 can be anything in this demo
+                    temp.append(b)
+                else:
+                    prev = temp[-1]
+                    # validate continuity
+                    if b.index != prev.index + 1 or b.previous_hash != prev.hash:
+                        return None
+                    # check PoW validity using blockchain rules
+                    if not self.blockchain.is_valid_pow(b):
+                        return None
+                    temp.append(b)
+            return temp
+        except Exception:
+            return None
 
     # ---------- networking / server ----------
     def start_node(self):
@@ -169,12 +210,16 @@ class GUI:
             messagebox.showerror("Error", "Invalid port")
             return
 
+        # update peers.local and ensure self included
         self.peers.local = (self.my_ip_value, self.port_value)
+        self.peer_info[(self.my_ip_value, self.port_value)] = self.node_name
+        self.peers.add(self.my_ip_value, self.port_value)  # ensure self present
 
         if not self.running:
             self.running = True
             threading.Thread(target=self._server_loop, daemon=True).start()
-            self.ui_call(self.log, f"Node started at {self.my_ip_value}:{self.port_value}")
+            self.ui_call(self.log, f"Node started at {self.my_ip_value}:{self.port_value} ({self.node_name})")
+            self.ui_call(self.update_peers_view)
 
     def _server_loop(self):
         try:
@@ -205,7 +250,7 @@ class GUI:
          - (legacy) NEW_BLOCK: direct append attempt
         """
         try:
-            raw = conn.recv(16384).decode().strip()
+            raw = conn.recv(32768).decode().strip()
             if not raw:
                 return
             msg = json.loads(raw)
@@ -213,31 +258,53 @@ class GUI:
 
             if mtype == MSG_JOIN:
                 ip, port = msg["ip"], int(msg["port"])
+                name = msg.get("name", f"{ip}:{port}")
                 self.peers.add(ip, port)
+                self.peer_info[(ip, port)] = name
                 self.ui_call(self.update_peers_view)
-                reply = {"type": MSG_PEERS, "peers": self.peers.as_list()}
+                # reply with peers list + chain for synchronization
+                peers_payload = []
+                for p_ip, p_port in self.peers.list():
+                    p_name = self.peer_info.get((p_ip, p_port), "")
+                    peers_payload.append([p_ip, p_port, p_name])
+                reply = {"type": MSG_PEERS, "peers": peers_payload, "chain": self._serialize_chain()}
                 conn.sendall(json.dumps(reply).encode())
-                self.ui_call(self.log, f"Peer joined: {ip}:{port}")
+                self.ui_call(self.log, f"Peer joined: {name} ({ip}:{port})")
 
             elif mtype == MSG_PEERS:
+                # Received peers list and maybe chain (from bootstrap)
                 peers_list = msg.get("peers", [])
                 for p in peers_list:
                     try:
                         ip, port = p[0], int(p[1])
+                        name = p[2] if len(p) > 2 else f"{ip}:{port}"
                         self.peers.add(ip, port)
+                        self.peer_info[(ip, port)] = name
                     except Exception:
                         continue
+                # chain syncing
+                remote_chain = msg.get("chain", [])
+                if remote_chain:
+                    cand = self._deserialize_chain_and_validate(remote_chain)
+                    if cand and len(cand) > len(self.blockchain.chain):
+                        self.blockchain.chain = cand
+                        self.ui_call(self.log, f"Replaced local chain with remote chain (len={len(cand)})")
+                        self.ui_call(self.update_chain_view)
                 self.ui_call(self.update_peers_view)
-                self.ui_call(self.log, "Received peers list")
+                self.ui_call(self.log, "Received peers list (and chain)")
 
             elif mtype == MSG_HELLO:
                 ip, port = msg["ip"], int(msg["port"])
+                name = msg.get("name", f"{ip}:{port}")
                 self.peers.add(ip, port)
+                self.peer_info[(ip, port)] = name
                 self.ui_call(self.update_peers_view)
-                self.ui_call(self.log, f"Handshake with {ip}:{port}")
+                self.ui_call(self.log, f"Handshake with {name} ({ip}:{port})")
 
             elif mtype == MSG_PROPOSE:
                 prop = msg.get("proposal")
+                proposer_name = msg.get("name", msg.get("proposal", {}).get("miner", "unknown"))
+                proposer_addr = msg.get("from", None)
                 if prop:
                     # reconstruct Block and store locally as current_proposal (synchronization)
                     try:
@@ -254,9 +321,9 @@ class GUI:
 
                     if newprop:
                         with self.vote_lock:
-                            # store proposal but do NOT start mining until a START arrives
+                            # store proposal but DO NOT start mining until START arrives
                             self.current_proposal = newprop
-                        self.ui_call(self.log, f"Stored PROPOSAL #{newprop.index} from {prop.get('miner')} (waiting for START)")
+                        self.ui_call(self.log, f"Stored PROPOSAL #{newprop.index} from {proposer_name} (waiting for START)")
 
                         # validate minimal things then reply vote (acts as ack + vote)
                         accept = False
@@ -268,7 +335,7 @@ class GUI:
                         except Exception:
                             accept = False
 
-                        vote_msg = {"type": MSG_VOTE, "vote": accept, "from": f"{self.my_ip_value}:{self.port_value}"}
+                        vote_msg = {"type": MSG_VOTE, "vote": accept, "from": f"{self.my_ip_value}:{self.port_value}", "name": self.node_name}
                         try:
                             conn.sendall(json.dumps(vote_msg).encode())
                             self.ui_call(self.log, f"Replied ACK/VOTE {'ACCEPT' if accept else 'REJECT'} for proposal #{newprop.index}")
@@ -295,9 +362,19 @@ class GUI:
             elif mtype == MSG_VOTE:
                 voter = msg.get("from")
                 vote_val = bool(msg.get("vote", False))
-                with self.vote_lock:
-                    self.votes[voter] = vote_val
-                self.ui_call(self.log, f"Vote from {voter}: {'ACCEPT' if vote_val else 'REJECT'}")
+                name = msg.get("name", None)
+                if voter:
+                    with self.vote_lock:
+                        self.votes[voter] = vote_val
+                    if name:
+                        # try to map name to ip:port if possible
+                        try:
+                            ip_s, port_s = voter.split(":")
+                            self.peer_info[(ip_s, int(port_s))] = name
+                            self.ui_call(self.update_peers_view)
+                        except Exception:
+                            pass
+                self.ui_call(self.log, f"Vote from {name or voter}: {'ACCEPT' if vote_val else 'REJECT'}")
 
             elif mtype == MSG_COMMIT:
                 block_data = msg.get("block")
@@ -327,6 +404,7 @@ class GUI:
                         self.ui_call(self.log, f"Error processing COMMIT: {e}")
 
             elif mtype == MSG_BLOCK:
+                # legacy direct block broadcast (already mined + commit)
                 block_data = msg.get("block")
                 if block_data:
                     try:
@@ -371,7 +449,8 @@ class GUI:
             return
 
         try:
-            msg = {"type": MSG_JOIN, "ip": self.my_ip_value, "port": self.port_value}
+            # include name in JOIN
+            msg = {"type": MSG_JOIN, "ip": self.my_ip_value, "port": self.port_value, "name": self.node_name}
             resp = self._send_and_recv(boot_ip, boot_port, msg, timeout=3)
             if not resp:
                 self.ui_call(self.log, f"Join failed: no response from bootstrap {boot_ip}:{boot_port}")
@@ -387,13 +466,29 @@ class GUI:
                 for p in data.get("peers", []):
                     try:
                         ip, port = p[0], int(p[1])
+                        name = p[2] if len(p) > 2 else f"{ip}:{port}"
                         self.peers.add(ip, port)
+                        self.peer_info[(ip, port)] = name
                     except Exception:
                         continue
+
+                # ensure bootstrap itself is included
                 self.peers.add(boot_ip, boot_port)
+                self.peer_info[(boot_ip, boot_port)] = data.get("peers", [[],[]])[0][2] if data.get("peers") else self.peer_info.get((boot_ip, boot_port), "bootstrap")
+
+                # chain sync if provided
+                remote_chain = data.get("chain", [])
+                if remote_chain:
+                    cand = self._deserialize_chain_and_validate(remote_chain)
+                    if cand and len(cand) > len(self.blockchain.chain):
+                        self.blockchain.chain = cand
+                        self.ui_call(self.log, f"Synced chain from bootstrap (len={len(cand)})")
+                        self.ui_call(self.update_chain_view)
+
                 self.ui_call(self.update_peers_view)
                 self.ui_call(self.log, "Received peers list from bootstrap")
 
+                # send HELLO to known peers (non-blocking)
                 for ip, port in self.peers.list():
                     if (ip, port) == (self.my_ip_value, self.port_value):
                         continue
@@ -404,7 +499,7 @@ class GUI:
 
     def _send_hello(self, ip, port):
         try:
-            msg = {"type": MSG_HELLO, "ip": self.my_ip_value, "port": self.port_value}
+            msg = {"type": MSG_HELLO, "ip": self.my_ip_value, "port": self.port_value, "name": self.node_name}
             self._send_and_recv(ip, port, msg, timeout=2, expect_reply=False)
         except Exception as e:
             self.ui_call(self.log, f"Hello to {ip}:{port} failed: {e}")
@@ -417,7 +512,7 @@ class GUI:
             s.sendall(json.dumps(msg).encode())
             data = None
             if expect_reply:
-                data = s.recv(16384).decode()
+                data = s.recv(32768).decode()
             s.close()
             return data
         except Exception as e:
@@ -432,7 +527,12 @@ class GUI:
             if not sel:
                 return
             text = self.peer_list.get(sel[0])
-            self.peer_combobox.set(text)
+            # extract ip:port from label "(ip:port)"
+            if "(" in text and ")" in text:
+                addr = text.split("(")[-1].strip(")")
+                self.peer_combobox.set(addr)
+            else:
+                self.peer_combobox.set(text)
         except Exception:
             pass
 
@@ -501,7 +601,7 @@ class GUI:
             "timestamp": proposal.timestamp,
             "miner": proposal.miner,
             "data": proposal.data
-        }}
+        }, "name": self.node_name, "from": f"{self.my_ip_value}:{self.port_value}"}
 
         ack_count = 0
         # sequential sending to collect replies reliably
@@ -520,10 +620,18 @@ class GUI:
                 if reply.get("type") == MSG_VOTE:
                     voter = reply.get("from")
                     vote_val = bool(reply.get("vote", False))
+                    voter_name = reply.get("name", None)
                     with self.vote_lock:
                         self.votes[voter] = vote_val
                     ack_count += 1
-                    self.ui_call(self.log, f"ACK/VOTE from {voter}: {'ACCEPT' if vote_val else 'REJECT'}")
+                    if voter_name:
+                        try:
+                            ip_s, port_s = voter.split(":")
+                            self.peer_info[(ip_s, int(port_s))] = voter_name
+                            self.ui_call(self.update_peers_view)
+                        except Exception:
+                            pass
+                    self.ui_call(self.log, f"ACK/VOTE from {voter_name or voter}: {'ACCEPT' if vote_val else 'REJECT'}")
                 else:
                     self.ui_call(self.log, f"Unexpected reply type from {ip_p}:{port_p}: {reply.get('type')}")
             except Exception as e:
@@ -536,9 +644,9 @@ class GUI:
                 self.votes = {}
             return
 
-        # all acked -> send START to peers so everyone starts mining same proposal
+        # all acked -> store proposal locally (already stored) and tell peers to START
         self.ui_call(self.log, f"All {total_peers} peers ACKed PROPOSE #{proposal.index} -> sending START")
-        start_msg = {"type": MSG_START, "index": proposal.index}
+        start_msg = {"type": MSG_START, "index": proposal.index, "name": self.node_name}
         for ip_p, port_p in peers_list:
             threading.Thread(target=self._send_and_recv, args=(ip_p, port_p, start_msg, 2, False), daemon=True).start()
 
@@ -557,10 +665,9 @@ class GUI:
 
                 if proposal_block.hash.startswith("0" * DIFFICULTY):
                     with self.vote_lock:
-                        total_nodes = len(self.peers.list()) + 1
-                        yes_votes = sum(1 for v in self.votes.values() if v)
-                    # NOTE: you said you adjusted vote counting yourself; here we check majority / all as you want
-                    needed = total_nodes  # keep strict all-nodes requirement; change if you prefer majority
+                        total_nodes = len(self.peers.list())  # peers list already includes self
+                        yes_votes = sum(1 for v in self.votes.values() if v) + 1
+                    needed = total_nodes  # strict all-nodes requirement (you can change to majority)
                     self.ui_call(self.log, f"Found nonce {proposal_block.nonce} for #{proposal_block.index} (hash={proposal_block.hash[:12]}...) votes_yes={yes_votes}/{total_nodes} need={needed}")
                     if yes_votes >= needed:
                         self.ui_call(self.log, f"Commit conditions met -> committing block #{proposal_block.index}")
@@ -571,8 +678,9 @@ class GUI:
                         else:
                             self.ui_call(self.log, f"Local append failed for #{proposal_block.index}")
 
-                        commit_msg = {"type": MSG_COMMIT, "block": proposal_block.to_dict()}
+                        commit_msg = {"type": MSG_COMMIT, "block": proposal_block.to_dict(), "name": self.node_name}
                         for ip_p, port_p in self.peers.list():
+                            # send to all peers including bootstrap; peers list includes self, so skip self when sending
                             if (ip_p, port_p) == (self.my_ip_value, self.port_value):
                                 continue
                             threading.Thread(target=self._send_and_recv, args=(ip_p, port_p, commit_msg, 2, False), daemon=True).start()
