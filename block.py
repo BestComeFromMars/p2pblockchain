@@ -1,17 +1,18 @@
+# block.py
 import hashlib
-import time
 import json
 from datetime import datetime
 
+# difficulty = number of leading zeros required in hex hash
 DIFFICULTY = 3
 
 class Block:
-    def __init__(self, index: int, timestamp: float, data, previous_hash: str = "", nonce: int = 0, miner: str = None):
-        self.index = index
-        self.timestamp = timestamp  # store as ISO string or float
+    def __init__(self, index: int, timestamp: str, data, previous_hash: str = "", nonce: int = 0, miner: str = None):
+        self.index = int(index)
+        self.timestamp = timestamp
         self.data = data
         self.previous_hash = previous_hash
-        self.nonce = nonce
+        self.nonce = int(nonce)
         self.miner = miner
         self.hash = self.calculate_hash()
 
@@ -35,23 +36,21 @@ class Block:
             f"PrevHash  : {self.previous_hash}\n"
             f"Hash      : {self.hash}\n"
             f"Data      : {self.data}\n"
-            f"{'-'*60}\n"
+            + "-"*60
         )
 
-
     def to_json(self):
-        # deterministic serialization for hashing/network
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
     def calculate_hash(self):
-        if self.index == 0:
-            return "0" * 64
-        raw = f"{self.index}{self.timestamp}{json.dumps(self.data, sort_keys=True, separators=(',', ':'))}{self.previous_hash}{self.nonce}"
+        # deterministic serialization for data
+        raw_data = json.dumps(self.data, sort_keys=True, separators=(",", ":"))
+        raw = f"{self.index}{self.timestamp}{raw_data}{self.previous_hash}{self.nonce}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def mine(self, difficulty=DIFFICULTY):
+    def mine(self, difficulty: int = DIFFICULTY):
         prefix = "0" * difficulty
-        # ensure nonce is int
+        # ensure nonce int
         if not isinstance(self.nonce, int):
             self.nonce = 0
         while True:
@@ -61,10 +60,8 @@ class Block:
             self.nonce += 1
 
     @classmethod
-    def create_new_block(cls, index: int, prev_block, data, miner: str = None, difficulty=DIFFICULTY):
-        prev_hash = prev_block.hash if prev_block is not None else ""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        b = cls(index=index, timestamp=timestamp, data=data, previous_hash=prev_hash, nonce=0, miner=miner)
-        # Mine synchronously here (demo) — can be moved to a thread if desired
-        b.mine(difficulty=difficulty)
+    def create_genesis(cls):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        b = cls(index=0, timestamp=ts, data={"genesis": True}, previous_hash="0"*64, nonce=0, miner="SYSTEM")
+        b.hash = b.calculate_hash()
         return b

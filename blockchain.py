@@ -1,5 +1,5 @@
+# blockchain.py
 from block import Block, DIFFICULTY
-from collections import Counter
 
 class Blockchain:
     def __init__(self, difficulty: int = DIFFICULTY):
@@ -31,12 +31,5 @@ class Blockchain:
             return True
         return False
 
-    def check_block_votes(self, votes, block: Block, prev_block: Block) -> bool:
-        vote_values = [pair[1] for pair in votes]  # votes like [('ip', 'yes'), ...]
-        counter = Counter(vote_values)
-        yes = counter.get('yes', 0)
-        no = counter.get('no', 0)
-        # require simple majority
-        if yes > no and self.is_valid_pow(block):
-            return True
-        return False
+    def height(self):
+        return len(self.chain)
